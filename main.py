@@ -166,7 +166,7 @@ async def voice_router(payload: DialogflowPayload):
 
     try:
         response = client.models.generate_content(
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             contents=history,
             config=config,
         )
@@ -262,7 +262,7 @@ async def voice_router(payload: DialogflowPayload):
 
         try:
             response = client.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-3-flash-preview",
                 contents=history,
                 config=types.GenerateContentConfig(tools=TOOLS),
             )
