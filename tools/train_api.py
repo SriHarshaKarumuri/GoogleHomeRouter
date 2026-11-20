@@ -116,12 +116,12 @@ def find_station_code(search_string: str) -> dict[str, str] | None:
     if not all_stations:
         return None
 
-    q = search_string.lower()
+    q = search_string.strip().lower()
     best: dict[str, Any] | None = None
     for s in all_stations:
-        name = (s.get("stationName") or "").lower()
-        city = (s.get("city") or "").lower()
-        code = (s.get("stationCode") or "").lower()
+        name = (s.get("stationName") or "").strip().lower()
+        city = (s.get("city") or "").strip().lower()
+        code = (s.get("stationCode") or "").strip().lower()
         score = 0
         if code == q:
             score = 100
