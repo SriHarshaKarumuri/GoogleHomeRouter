@@ -83,22 +83,28 @@ def search_stations(search_string: str) -> str:
     return "\n".join(lines)
 
 
+_station_cache: dict[str, dict[str, str]] = {}
+
+
 def find_station_code(search_string: str) -> dict[str, str] | None:
-    """Return the best-match station code for a search string."""
-    results = search_stations(search_string)
+    """Return the best-match station code for a search string (with 1h cache)."""
+    key = search_string.lower()
+    cached = _station_cache.get(key)
+    if cached:
+        return cached
     import httpx
 
     url = f"{_CT_BASE}/api/v2/trains/stations/auto-suggestion"
     params = {
         "searchString": search_string,
         "sourceStnCode": "",
-        "popularStnListLimit": 15,
-        "preferredStnListLimit": 6,
+        "popularStnListLimit": 5,
+        "preferredStnListLimit": 3,
         "channel": "mwebd",
         "language": "EN",
     }
     try:
-        resp = httpx.get(url, params=params, follow_redirects=True, timeout=10.0)
+        resp = httpx.get(url, params=params, follow_redirects=True, timeout=8.0)
         data = resp.json().get("data", {})
     except Exception:
         return None
@@ -131,7 +137,9 @@ def find_station_code(search_string: str) -> dict[str, str] | None:
             best = {**s, "_score": score}
 
     if best:
-        return {"code": best["stationCode"], "name": best["stationName"]}
+        result = {"code": best["stationCode"], "name": best["stationName"]}
+        _station_cache[key] = result
+        return result
     return None
 
 
