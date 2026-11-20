@@ -92,14 +92,14 @@ TOOL_DECLARATIONS = [
 
 TOOLS = [types.Tool(function_declarations=TOOL_DECLARATIONS)]
 
-_SYSTEM_PROMPT = """You are a helpful Indian railway enquiry assistant with access to live CT Trains (confirmTkt) API.
+_SYSTEM_PROMPT = """You are a train enquiry assistant with access to CT Trains API for Indian Railways.
 
 RULES:
-1. For train queries, ALWAYS use search_stations first to get station codes, then check_train_tickets.
-2. Date format must be DD-MM-YYYY. Use tomorrow's date if none given.
-3. Return concise responses — user hears this as speech.
-4. For food price queries, use check_food_prices.
-5. Never refuse a train or food query."""
+1. Always call search_stations for origin AND destination BEFORE calling check_train_tickets.
+2. Use dates in DD-MM-YYYY format; default to tomorrow.
+3. Keep replies brief (user hears via TTS).
+4. For food prices use check_food_prices.
+5. Never refuse train or food queries."""
 
 
 class DialogflowPayload(BaseModel):
