@@ -138,66 +138,24 @@ async def voice_router(payload: DialogflowPayload):
         raise HTTPException(status_code=400, detail="queryText is required")
 
     client = app.state.client
-
-    # Maintain per-session conversation history
-    history = _session_histories.setdefault(session_id, [])
-
-    # Append user message (ensure it's a Content object)
-    history.append(types.Content(parts=[types.Part(text=query_text)], role="user"))
-
-    # Force tool use via system instructions if necessary
     config = types.GenerateContentConfig(
         tools=TOOLS,
         system_instruction=[types.Part(text=_SYSTEM_PROMPT)]
     )
+    history = _session_histories.setdefault(session_id, [])
+    history.append(types.Content(parts=[types.Part(text=query_text)], role="user"))
+
+    def _is_quota_error(err):
+        s = str(err)
+        return "429" in s or "RESOURCE_EXHAUSTED" in s or "UNAVAILABLE" in s or "NOT_FOUND" in s
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=history,
-            config=config,
-        )
+        response = client.models.generate_content(model="gemini-3.5-flash", contents=history, config=config)
     except Exception as e:
-        err_str = str(e)
-        # Detect API errors (quota exceeded, 503, etc.) and fall back to direct tool execution
-        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "UNAVAILABLE" in err_str:
-            q_lower = query_text.lower()
-            # Check for train-related intent (English or Chinese)
-            if any(k in q_lower for k in ["train", "trains", "火车", "票", "查一", "车"]):
-                import re as _re
-                from datetime import datetime, timedelta
-                today = datetime.now()
-                tomorrows_date = (today + timedelta(days=1)).strftime("%d-%m-%Y")
-                # Extract from/to pattern
-                m_from_to = _re.search(r'(?:from|[转到])\s*([^\s,]+?)\s*(?:to|到)\s*([^\s,]+)', q_lower)
-                orig, dest = "", ""
-                date = tomorrows_date
-                if m_from_to:
-                    orig = m_from_to.group(1).strip().title()
-                    dest = m_from_to.group(2).strip().title()
-                # Extract date if present
-                m_date = _re.search(r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})', q_lower)
-                if m_date:
-                    day = m_date.group(1).zfill(2)
-                    months = {'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
-                              'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12'}
-                    date = f"{day}-{months.get(m_date.group(2),'01')}-{m_date.group(3)}"
-                # Try to execute with parsed params or full query as fallback
-                try:
-                    result_text = check_train_tickets(origin=orig or query_text, destination=dest, date=date, train_number="", travel_class="")
-                    return {"fulfillmentText": result_text}
-                except Exception as ex:
-                    return {"fulfillmentText": f"Train service temporarily unavailable: {ex}"}
-            # Check for food-related intent
-            elif any(k in q_lower for k in ["food", "price", "dish", "餐", "菜", "价格"]):
-                try:
-                    result_text = check_food_prices(dish_name=query_text)
-                    return {"fulfillmentText": result_text}
-                except Exception as ex:
-                    return {"fulfillmentText": f"Food service temporarily unavailable: {ex}"}
-        raise HTTPException(status_code=500, detail=f"GenAI request failed: {err_str}")
+        if _is_quota_error(e):
+            return await _direct_tool_response(query_text, session_id)
+        raise HTTPException(status_code=500, detail=f"GenAI request failed: {str(e)}")
 
-    # Extract function calls — prefer resp.function_calls; fall back to resp.candidates
     function_calls = list(response.function_calls) if response.function_calls else []
     raw_fc_parts: list[types.Part] = []
     if not function_calls and response.candidates:
@@ -206,24 +164,19 @@ async def voice_router(payload: DialogflowPayload):
                 if p.function_call:
                     function_calls.append(p.function_call)
                     raw_fc_parts.append(p)
-    elif function_calls:
-        # Re-link function_calls to their original Parts (with thought_signature) via candidates
-        if response.candidates:
-            seen = set()
-            for c in response.candidates:
-                for p in c.content.parts or []:
-                    if p.function_call and id(p.function_call) not in seen:
-                        seen.add(id(p.function_call))
-                        raw_fc_parts.append(p)
+    elif function_calls and response.candidates:
+        seen = set()
+        for c in response.candidates:
+            for p in c.content.parts or []:
+                if p.function_call and id(p.function_call) not in seen:
+                    seen.add(id(p.function_call))
+                    raw_fc_parts.append(p)
 
     if function_calls:
-        # Preserve original Parts (includes thought_signature required by API)
         if not raw_fc_parts and response.candidates:
             raw_fc_parts = [p for p in (response.candidates[0].content.parts or []) if p.function_call]
         history.append(types.Content(parts=raw_fc_parts or [types.Part(function_call=fc) for fc in function_calls], role="model"))
 
-        # Execute tools and collect results
-        tool_results = []
         for fc in function_calls:
             fn_name = fc.name
             args = fc.args or {}
@@ -231,41 +184,70 @@ async def voice_router(payload: DialogflowPayload):
             if func:
                 try:
                     result = func(**args)
-                    tool_results.append({"name": fn_name, "result": result})
-                except Exception as e:
-                    tool_results.append({"name": fn_name, "result": f"Error executing {fn_name}: {str(e)}"})
-            else:
-                tool_results.append({"name": fn_name, "result": f"Unknown function: {fn_name}"})
+                except Exception as ex:
+                    result = f"Error: {ex}"
+                history.append(types.Content(
+                    parts=[types.Part(function_response=types.FunctionResponse(name=fn_name, response={"result": result}))],
+                    role="user",
+                ))
 
-        # Append tool results to history and call Gemini again to get final response
-        for tr in tool_results:
-            history.append(types.Content(
-                parts=[types.Part(function_response=types.FunctionResponse(
-                    name=tr["name"],
-                    response={"result": tr["result"]}
-                ))],
-                role="user",
-            ))
-
+        # Retry Gemini after tool results — fall back to direct parsing on quota error
         try:
-            response = client.models.generate_content(
-                model="gemini-3.5-flash",
-                contents=history,
-                config=types.GenerateContentConfig(tools=TOOLS),
-            )
+            response = client.models.generate_content(model="gemini-3.5-flash", contents=history, config=types.GenerateContentConfig(tools=TOOLS))
         except Exception as e:
+            if _is_quota_error(e):
+                return await _direct_tool_response(query_text, session_id)
             return {"fulfillmentText": f"Sorry, an error occurred processing your request: {str(e)}"}
 
-    # Extract text from final response
     fulfillment_text = "".join(part.text for part in response.parts if part.text)
     if not fulfillment_text:
         fulfillment_text = "I'm sorry, I couldn't find relevant information for your request."
 
-    # Append assistant text response to history (keep last 6 round-trips for context)
     history.append(types.Content(parts=[types.Part(text=fulfillment_text)], role="model"))
     _session_histories[session_id] = history[-12:] if len(history) > 12 else history
-
     return {"fulfillmentText": fulfillment_text}
+
+
+async def _direct_tool_response(query_text: str, session_id: str) -> dict:
+    """Fallback when Gemini quota is exhausted — parse query and call tools directly."""
+    import re as _re
+    from datetime import datetime, timedelta
+
+    q_lower = query_text.lower()
+    today = datetime.now()
+    tomorrows_date = (today + timedelta(days=1)).strftime("%d-%m-%Y")
+    orig, dest, date = "", "", tomorrows_date
+
+    m_from_to = _re.search(r'(?:from|[转到])\s*([^\s,]+?)\s*(?:to|到)\s*([^\s,]+)', q_lower)
+    if m_from_to:
+        orig = m_from_to.group(1).strip().title()
+        dest = m_from_to.group(2).strip().title()
+
+    m_date = _re.search(r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})', q_lower)
+    if m_date:
+        day = m_date.group(1).zfill(2)
+        months = {'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
+                  'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12'}
+        date = f"{day}-{months.get(m_date.group(2),'01')}-{m_date.group(3)}"
+
+    if any(k in q_lower for k in ["train", "trains", "火车", "票", "查一", "车"]):
+        try:
+            result = check_train_tickets(origin=orig or query_text, destination=dest, date=date, train_number="", travel_class="")
+            history = _session_histories.setdefault(session_id, [])
+            history.append(types.Content(parts=[types.Part(text=result)], role="model"))
+            _session_histories[session_id] = history[-12:]
+            return {"fulfillmentText": result}
+        except Exception as ex:
+            return {"fulfillmentText": f"Train service temporarily unavailable: {ex}"}
+
+    if any(k in q_lower for k in ["food", "price", "dish", "餐", "菜", "价格"]):
+        try:
+            result = check_food_prices(dish_name=query_text)
+            return {"fulfillmentText": result}
+        except Exception as ex:
+            return {"fulfillmentText": f"Food service temporarily unavailable: {ex}"}
+
+    return {"fulfillmentText": "Gemini AI service is currently busy. Please try again later."}
 
 
 @app.get("/health")
